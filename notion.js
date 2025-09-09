@@ -30,7 +30,21 @@ exports.getDatabaseProperties = async (database_id) => {
   return db.properties || {};
 };
 
+async function getDatabaseTitleKey(database_id) {
+  const r = await fetch(`${API}/databases/${database_id}`, { headers });
+  const db = await r.json();
+  const props = db.properties || {};
+  for (const [name, prop] of Object.entries(props)) {
+    if (prop.type === "title") return name; // ej: "Name", "Client Name", etc.
+  }
+  return "Name"; // fallback común
+}
+exports.getDatabaseTitleKey = getDatabaseTitleKey;
+
 exports.searchPagesInDatabase = async (database_id, query = "") => {
+  // Determina la propiedad de título real de la DB
+  const titleKey = await getDatabaseTitleKey(database_id);
+
   const r = await fetch(`${API}/search`, {
     method: "POST",
     headers,
@@ -41,12 +55,19 @@ exports.searchPagesInDatabase = async (database_id, query = "") => {
     })
   });
   const j = await r.json();
+
   const inDb = (j.results || []).filter(p => p.parent?.database_id === database_id);
-  return inDb.map(p => ({
-    id: p.id,
-    title: p.properties?.Name?.title?.[0]?.plain_text || p.properties?.name?.title?.[0]?.plain_text || p.id,
-    url: p.url
-  }));
+
+  return inDb.map(p => {
+    const tProp = p.properties?.[titleKey];
+    const title =
+      tProp?.type === "title" ? (tProp.title?.[0]?.plain_text || p.id) :
+      p.properties?.Name?.title?.[0]?.plain_text ||
+      p.properties?.name?.title?.[0]?.plain_text ||
+      p.id;
+
+    return { id: p.id, title, url: p.url };
+  });
 };
 
 exports.createPage = async (database_id, properties) => {
@@ -71,3 +92,4 @@ exports.getPage = async (page_id) => {
   const r = await fetch(`${API}/pages/${page_id}`, { headers });
   return r.json();
 };
+
