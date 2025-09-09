@@ -2,14 +2,10 @@ require("dotenv").config();
 const { App, ExpressReceiver } = require("@slack/bolt");
 const notion = require("./notion");
 const {
-  buildCreateBlocks,
-  buildCreatePickerBlocks,
+  buildCreateOrEditBlocks,
   buildEditSelectBlocks,
-  buildEditBlocks,
   parseSubmission,
   collectRelationTargets,
-  convertPageToInitials,
-  buildParentSummaryBlocks,
 } = require("./blocks");
 
 /** ====== ExpressReceiver + Health ====== */
@@ -18,7 +14,7 @@ const receiver = new ExpressReceiver({
   processBeforeResponse: true,
 });
 
-// Logs de tráfico para debug (verás una línea por request)
+// Logs de tráfico para debug
 receiver.app.use((req, _res, next) => {
   if (req.path === "/slack/events") {
     console.log("[/slack/events] incoming", new Date().toISOString(), req.method);
@@ -36,7 +32,6 @@ const app = new App({
   receiver,
 });
 
-// Manejo global de errores Bolt
 app.error((err) => {
   console.error("⚠️ Bolt error:", err);
 });
@@ -47,12 +42,10 @@ const A = {
   DB: "db_select",
   PAGE: "page_select",
   PROP_PREFIX: "prop::",
-  CHOOSE_PROPS: "choose_props",
 };
 
 const VIEW = {
   STEP1: "v_step1",
-  CREATE_PICK: "v_create_pick",
   CREATE_FORM: "v_create_form",
   EDIT_PICK: "v_edit_pick",
   EDIT_FORM: "v_edit_form",
@@ -63,7 +56,7 @@ const SHORTCUT_ID = process.env.SLACK_SHORTCUT_ID || "push_to_notion";
 
 /** ====== Shortcut: abre Step 1 ====== */
 app.shortcut(SHORTCUT_ID, async ({ shortcut, ack, client }) => {
-  // Ack inmediato para evitar timeouts 499
+  // Ack inmediato para evitar timeouts (499)
   await ack();
 
   try {
@@ -152,7 +145,7 @@ app.options(/prop::/, async ({ options, ack, body }) => {
   await ack({ options: opts });
 });
 
-/** ====== STEP1 -> ramifica a CREATE/EDIT/SUBTASK (responde con update) ====== */
+/** ====== STEP1 -> ramifica a CREATE / EDIT / SUBTASK ====== */
 app.view(VIEW.STEP1, async ({ ack, view }) => {
   const state = view.state.values;
   const mode = state[A.MODE]?.[A.MODE]?.selected_option?.value;
@@ -203,15 +196,20 @@ app.view(VIEW.STEP1, async ({ ack, view }) => {
       });
     }
 
-    // CREATE: primero picker de propiedades (como "+ Add Property")
-    const blocks = buildCreatePickerBlocks({ A, props: dbProps });
+    // CREATE: renderiza todas las props (solo Title requerido)
+    const blocks = buildCreateOrEditBlocks({
+      A,
+      props: dbProps,
+      mode: "create",
+    });
+
     return ack({
       response_action: "update",
       view: {
         type: "modal",
-        callback_id: VIEW.CREATE_PICK,
-        title: { type: "plain_text", text: "Send to Notion" },
-        submit: { type: "plain_text", text: "Next" },
+        callback_id: VIEW.CREATE_FORM,
+        title: { type: "plain_text", text: "Create page" },
+        submit: { type: "plain_text", text: "Create" },
         private_metadata: JSON.stringify(meta),
         blocks
       }
@@ -225,45 +223,7 @@ app.view(VIEW.STEP1, async ({ ack, view }) => {
   }
 });
 
-/** ====== CREATE_PICK -> render formulario con props elegidas ====== */
-app.view(VIEW.CREATE_PICK, async ({ ack, view }) => {
-  let md = {};
-  try { md = JSON.parse(view.private_metadata || "{}"); } catch {}
-  const { database_id } = md;
-
-  const selected = view.state.values?.[A.CHOOSE_PROPS]?.[A.CHOOSE_PROPS]?.selected_options || [];
-  const selectedPropNames = selected.map(o => o.value);
-
-  try {
-    const dbProps = await notion.getDatabaseProperties(database_id);
-    const blocks = buildCreateBlocks({
-      A,
-      props: dbProps,
-      meta: md,
-      onlyProps: selectedPropNames,
-    });
-
-    return ack({
-      response_action: "update",
-      view: {
-        type: "modal",
-        callback_id: VIEW.CREATE_FORM,
-        title: { type: "plain_text", text: "Create page" },
-        submit: { type: "plain_text", text: "Create" },
-        private_metadata: JSON.stringify({ ...md, onlyProps: selectedPropNames }),
-        blocks
-      }
-    });
-  } catch (e) {
-    console.error("CREATE_PICK error:", e);
-    return ack({
-      response_action: "errors",
-      errors: { [A.CHOOSE_PROPS]: "Couldn’t load properties. Try again." },
-    });
-  }
-});
-
-/** ====== EDIT_PICK -> cargar form de edición o subtask (responde con update) ====== */
+/** ====== EDIT_PICK -> cargar form de edición o subtask ====== */
 app.view(VIEW.EDIT_PICK, async ({ ack, view }) => {
   let md = {};
   try { md = JSON.parse(view.private_metadata || "{}"); } catch {}
@@ -283,7 +243,12 @@ app.view(VIEW.EDIT_PICK, async ({ ack, view }) => {
 
     if (mode === "edit") {
       const page = await notion.getPage(page_id);
-      const blocks = buildEditBlocks({ A, props: dbProps, page, meta: { ...md, page_id } });
+      const blocks = buildCreateOrEditBlocks({
+        A,
+        props: dbProps,
+        mode: "edit",
+        initialPage: page, // prefill
+      });
       return ack({
         response_action: "update",
         view: {
@@ -297,18 +262,12 @@ app.view(VIEW.EDIT_PICK, async ({ ack, view }) => {
       });
     }
 
-    // SUBTASK: snapshot + prefills heredados del parent
-    const parentPage = await notion.getPage(page_id);
-    const initialFromParent = convertPageToInitials(parentPage);
-    const blocks = [
-      ...buildParentSummaryBlocks(parentPage, dbProps),
-      ...buildCreateBlocks({
-        A,
-        props: dbProps,
-        meta: { ...md, parent_page_id: page_id, as_subtask: true },
-        initial: initialFromParent,
-      })
-    ];
+    // SUBTASK: formulario vacío (sin snapshot ni prefills), pero luego enlazamos al parent
+    const blocks = buildCreateOrEditBlocks({
+      A,
+      props: dbProps,
+      mode: "subtask",
+    });
 
     return ack({
       response_action: "update",
@@ -341,6 +300,7 @@ app.view(VIEW.CREATE_FORM, async ({ ack, body, view, client }) => {
   const properties = parseSubmission({ values: view.state.values, props: dbProps });
 
   if (as_subtask) {
+    // Si hay una relation a la misma DB, vincula al parent
     const parentRel = Object.entries(dbProps).find(([_, p]) =>
       p?.type === "relation" && (p.relation?.database_id === database_id)
     );
