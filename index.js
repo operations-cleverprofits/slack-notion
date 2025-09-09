@@ -128,113 +128,127 @@ app.options(/prop::/, async ({ options, ack, body }) => {
 });
 
 /** ====== Submit Step 1 -> ramifica a CREATE / EDIT / SUBTASK ====== */
-app.view(VIEW.STEP1, async ({ ack, body, view, client }) => {
-  await ack();
-
+app.view(VIEW.STEP1, async ({ ack, view }) => {
+  // Lee selección del usuario
   const state = view.state.values;
-  const mode = state[A.MODE][A.MODE]?.selected_option?.value;
-  const database_id = state[A.DB][A.DB]?.selected_option?.value;
+  const mode = state[A.MODE]?.[A.MODE]?.selected_option?.value;
+  const database_id = state[A.DB]?.[A.DB]?.selected_option?.value;
 
-  if (!mode || !database_id) return;
+  // Validación: si falta algo, muestra error en el propio modal
+  if (!mode || !database_id) {
+    return ack({
+      response_action: "errors",
+      errors: {
+        [A.MODE]: !mode ? "Select an action." : undefined,
+        [A.DB]: !database_id ? "Select a database." : undefined,
+      },
+    });
+  }
 
-  // Cargamos propiedades de la DB
-  const dbProps = await notion.getDatabaseProperties(database_id);
-  const relations = collectRelationTargets(dbProps); // { [propName]: relatedDatabaseId }
+  try {
+    // Cargamos propiedades de la DB
+    const dbProps = await notion.getDatabaseProperties(database_id);
+    const relations = collectRelationTargets(dbProps); // { [propName]: relatedDatabaseId }
+    const meta = { mode, database_id, relations };
 
-  // Se guarda en private_metadata para vistas posteriores
-  const meta = { mode, database_id, relations };
+    if (mode === "edit") {
+      // Pedir selección de página y luego cargar valores
+      const blocks = buildEditSelectBlocks({ A, meta });
+      return ack({
+        response_action: "update",
+        view: {
+          type: "modal",
+          callback_id: VIEW.EDIT_PICK,
+          title: { type: "plain_text", text: "Edit page" },
+          submit: { type: "plain_text", text: "Load" },
+          private_metadata: JSON.stringify(meta),
+          blocks
+        }
+      });
+    }
 
-  if (mode === "edit") {
-    // Pedir selección de página y luego cargar valores
-    const blocks = buildEditSelectBlocks({ A, meta });
-    await client.views.update({
-      view_id: view.id,
+    if (mode === "subtask") {
+      // Primero pedimos el parent page, luego mostramos propiedades
+      const blocks = buildEditSelectBlocks({ A, meta, label: "Parent page" });
+      return ack({
+        response_action: "update",
+        view: {
+          type: "modal",
+          callback_id: VIEW.EDIT_PICK, // reutilizamos handler para cargar luego el form
+          title: { type: "plain_text", text: "Add Subtask" },
+          submit: { type: "plain_text", text: "Continue" },
+          private_metadata: JSON.stringify({ ...meta, mode: "subtask" }),
+          blocks
+        }
+      });
+    }
+
+    // CREATE directamente: renderizar propiedades vacías
+    const blocks = buildCreateBlocks({ A, props: dbProps, meta });
+    return ack({
+      response_action: "update",
       view: {
         type: "modal",
-        callback_id: VIEW.EDIT_PICK,
-        title: { type: "plain_text", text: "Edit page" },
-        submit: { type: "plain_text", text: "Load" },
+        callback_id: VIEW.CREATE_FORM,
+        title: { type: "plain_text", text: "Create page" },
+        submit: { type: "plain_text", text: "Create" },
         private_metadata: JSON.stringify(meta),
         blocks
       }
     });
-    return;
-  }
-
-  if (mode === "subtask") {
-    // subtask = crear página con relación al padre en la MISMA DB
-    // Primero pedimos el parent page, luego mostramos propiedades
-    const blocks = buildEditSelectBlocks({ A, meta, label: "Parent page" });
-    await client.views.update({
-      view_id: view.id,
-      view: {
-        type: "modal",
-        callback_id: VIEW.EDIT_PICK, // reutilizamos handler para cargar luego el form
-        title: { type: "plain_text", text: "Add Subtask" },
-        submit: { type: "plain_text", text: "Continue" },
-        private_metadata: JSON.stringify({ ...meta, mode: "subtask" }),
-        blocks
-      }
+  } catch (e) {
+    console.error("STEP1 error:", e);
+    return ack({
+      response_action: "errors",
+      errors: { [A.DB]: "I couldn’t load this database. Check access and try again." },
     });
-    return;
   }
-
-  // CREATE directamente: renderizar propiedades vacías
-  const blocks = buildCreateBlocks({ A, props: dbProps, meta });
-  await client.views.update({
-    view_id: view.id,
-    view: {
-      type: "modal",
-      callback_id: VIEW.CREATE_FORM,
-      title: { type: "plain_text", text: "Create page" },
-      submit: { type: "plain_text", text: "Create" },
-      private_metadata: JSON.stringify(meta),
-      blocks
-    }
-  });
 });
 
 /** ====== Submit: elegir página (EDIT) o elegir parent (SUBTASK) -> cargar form ====== */
-app.view(VIEW.EDIT_PICK, async ({ ack, body, view, client }) => {
-  await ack();
-
+app.view(VIEW.EDIT_PICK, async ({ ack, view }) => {
   let md = {};
   try { md = JSON.parse(view.private_metadata || "{}"); } catch {}
   const { mode, database_id } = md;
 
   const state = view.state.values;
-  const page_id = state[A.PAGE]?.[A.PAGE]?.selected_option?.value;
-  if (!page_id) return;
+  const page_id = state?.[A.PAGE]?.[A.PAGE]?.selected_option?.value;
 
-  // Propiedades de DB + datos de página seleccionada
-  const dbProps = await notion.getDatabaseProperties(database_id);
-
-  if (mode === "edit") {
-    const page = await notion.getPage(page_id);
-    const blocks = buildEditBlocks({ A, props: dbProps, page, meta: { ...md, page_id } });
-    await client.views.update({
-      view_id: view.id,
-      view: {
-        type: "modal",
-        callback_id: VIEW.EDIT_FORM,
-        title: { type: "plain_text", text: "Edit page" },
-        submit: { type: "plain_text", text: "Update" },
-        private_metadata: JSON.stringify({ ...md, page_id }),
-        blocks
-      }
+  if (!page_id) {
+    return ack({
+      response_action: "errors",
+      errors: { [A.PAGE]: "Select a page." },
     });
-    return;
   }
 
-  if (mode === "subtask") {
-    // Creamos un form de CREATE, pero con la relación al parent pre-establecida
+  try {
+    const dbProps = await notion.getDatabaseProperties(database_id);
+
+    if (mode === "edit") {
+      const page = await notion.getPage(page_id);
+      const blocks = buildEditBlocks({ A, props: dbProps, page, meta: { ...md, page_id } });
+      return ack({
+        response_action: "update",
+        view: {
+          type: "modal",
+          callback_id: VIEW.EDIT_FORM,
+          title: { type: "plain_text", text: "Edit page" },
+          submit: { type: "plain_text", text: "Update" },
+          private_metadata: JSON.stringify({ ...md, page_id }),
+          blocks
+        }
+      });
+    }
+
+    // SUBTASK: form de creación con relación al parent pre-establecida
     const blocks = buildCreateBlocks({
       A,
       props: dbProps,
       meta: { ...md, parent_page_id: page_id, as_subtask: true }
     });
-    await client.views.update({
-      view_id: view.id,
+
+    return ack({
+      response_action: "update",
       view: {
         type: "modal",
         callback_id: VIEW.CREATE_FORM,
@@ -244,6 +258,12 @@ app.view(VIEW.EDIT_PICK, async ({ ack, body, view, client }) => {
         blocks
       }
     });
+  } catch (e) {
+    console.error("EDIT_PICK error:", e);
+    return ack({
+      response_action: "errors",
+      errors: { [A.PAGE]: "Couldn’t load the page or database. Try again." },
+    });
   }
 });
 
@@ -252,17 +272,16 @@ app.view(VIEW.CREATE_FORM, async ({ ack, body, view, client }) => {
   await ack();
   let md = {};
   try { md = JSON.parse(view.private_metadata || "{}"); } catch {}
-  const { database_id, as_subtask, parent_page_id, relations } = md;
+  const { database_id, as_subtask, parent_page_id } = md;
 
   const dbProps = await notion.getDatabaseProperties(database_id);
   const properties = parseSubmission({ values: view.state.values, props: dbProps });
 
-  // Si es subtask, intentamos setear relación padre (sub-items nativos o self-relation)
+  // Si es subtask, intenta setear relación padre (sub-items nativos o self-relation)
   if (as_subtask) {
-    // heurística: busca una relación self-relation llamada "Parent" o alguna relation que apunte a la misma DB
+    // Heurística: busca una relación self-relation llamada "Parent" o cualquier relation hacia la misma DB
     const parentRel = Object.entries(dbProps).find(([name, p]) =>
-      p?.type === "relation" && (p.relation?.database_id === database_id) &&
-      (name.toLowerCase().includes("parent") || name.toLowerCase().includes("sub") || true)
+      p?.type === "relation" && (p.relation?.database_id === database_id)
     );
     if (parentRel) {
       const [propName] = parentRel;
@@ -302,3 +321,4 @@ app.view(VIEW.EDIT_FORM, async ({ ack, body, view, client }) => {
   await app.start(process.env.PORT || 3000);
   console.log("⚡️ Slack ↔ Notion running on port", process.env.PORT || 3000);
 })();
+
