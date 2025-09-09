@@ -19,18 +19,48 @@ exports.collectRelationTargets = (props) => {
   return rels;
 };
 
-exports.buildCreateBlocks = ({ A, props, meta }) => {
-  return renderProps({ A, props, meta, initial: null });
+/** ---------- CREATE: primer paso "elige properties" (tipo +Add Property) ---------- */
+exports.buildCreatePickerBlocks = ({ A, props }) => {
+  const options = [];
+  for (const [name, prop] of Object.entries(props || {})) {
+    if (!isEditable(prop)) continue;
+    if (prop.type === "title") continue; // Title siempre se incluye
+    options.push({ text: { type: "plain_text", text: name }, value: name });
+  }
+  options.sort((a, b) => a.text.text.localeCompare(b.text.text));
+
+  return [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: "*Select which properties you want to fill.*\n_Title is always included._" }
+    },
+    {
+      type: "input",
+      block_id: A.CHOOSE_PROPS,
+      label: { type: "plain_text", text: "Properties" },
+      element: {
+        type: "multi_static_select",
+        action_id: A.CHOOSE_PROPS,
+        placeholder: { type: "plain_text", text: "Pick properties…" },
+        options
+      }
+    }
+  ];
+};
+
+/** ---------- Render de inputs (Create / Edit) ---------- */
+exports.buildCreateBlocks = ({ A, props, meta, onlyProps = null, initial = null }) => {
+  return renderProps({ A, props, meta, initial, onlyProps });
 };
 
 exports.buildEditSelectBlocks = ({ A, meta, label = "Page" }) => ([
   {
     type: "input",
-    block_id: A.PAGE,
+    block_id: "page_select",
     label: { type: "plain_text", text: label },
     element: {
       type: "external_select",
-      action_id: A.PAGE,
+      action_id: "page_select",
       min_query_length: 0,
       placeholder: { type: "plain_text", text: "Search..." }
     }
@@ -38,20 +68,72 @@ exports.buildEditSelectBlocks = ({ A, meta, label = "Page" }) => ([
 ]);
 
 exports.buildEditBlocks = ({ A, props, page, meta }) => {
-  // Transforma la Page de Notion en valores iniciales de Slack
   const initial = convertPageToInitials(page);
   return renderProps({ A, props, meta, initial });
 };
 
-function renderProps({ A, props, meta, initial }) {
+/** ---------- Resumen compacto del parent en "Add Subtask" ---------- */
+exports.buildParentSummaryBlocks = (page, dbProps) => {
+  const props = page?.properties || {};
+  const lines = [];
+  const candidates = ["Status", "Type", "Year", "Owner", "Assignee", "Due", "Date", "Client Name", "Name"];
+
+  for (const c of candidates) {
+    if (!props[c]) continue;
+    const v = humanizeValue(props[c]);
+    if (v) lines.push(`• *${c}:* ${v}`);
+  }
+
+  if (!lines.length) {
+    const keys = Object.keys(dbProps || {}).filter(k => isEditable(dbProps[k])).slice(0, 5);
+    for (const k of keys) {
+      if (!props[k]) continue;
+      const v = humanizeValue(props[k]);
+      if (v) lines.push(`• *${k}:* ${v}`);
+    }
+  }
+
+  if (!lines.length) return [];
+  return [
+    { type: "section", text: { type: "mrkdwn", text: "*Parent snapshot*" } },
+    { type: "section", text: { type: "mrkdwn", text: lines.join("\n") } },
+    { type: "divider" }
+  ];
+};
+
+function humanizeValue(prop) {
+  switch (prop.type) {
+    case "title": return prop.title?.[0]?.plain_text || "";
+    case "rich_text": return prop.rich_text?.[0]?.plain_text || "";
+    case "number": return (prop.number ?? "").toString();
+    case "url": return prop.url || "";
+    case "email": return prop.email || "";
+    case "phone_number": return prop.phone_number || "";
+    case "select": return prop.select?.name || "";
+    case "multi_select": return (prop.multi_select || []).map(o => o.name).join(", ");
+    case "date": return prop.date?.start || "";
+    case "checkbox": return prop.checkbox ? "Yes" : "No";
+    case "status": return prop.status?.name || "";
+    case "relation": return (prop.relation || []).length ? `${prop.relation.length} linked` : "";
+    default: return "";
+  }
+}
+
+function renderProps({ A, props, meta, initial, onlyProps }) {
   const blocks = [];
 
+  const include = (name, prop) => {
+    if (!isEditable(prop)) return false;
+    if (!onlyProps) return true;           // sin filtro: incluye todos
+    if (prop.type === "title") return true;
+    return onlyProps.includes(name);
+  };
+
   for (const [name, prop] of Object.entries(props || {})) {
-    if (!isEditable(prop)) continue;
+    if (!include(name, prop)) continue;
 
-    const action_id = `${"prop::"}${name}`;
-    const block_id = action_id; // igual para leer fácil
-
+    const action_id = `prop::${name}`;
+    const block_id = action_id;
     const label = { type: "plain_text", text: name };
 
     switch (prop.type) {
@@ -60,7 +142,7 @@ function renderProps({ A, props, meta, initial }) {
       case "url":
       case "email":
       case "phone_number":
-      case "number": {
+      case "number":
         blocks.push({
           type: "input",
           block_id,
@@ -73,16 +155,8 @@ function renderProps({ A, props, meta, initial }) {
           }
         });
         break;
-      }
 
-      case "select": {
-        const options = (prop.select?.options || []).map(o => ({
-          text: { type: "plain_text", text: o.name }, value: o.name
-        }));
-        const initial_option = initial?.[name]?.select
-          ? { text: { type: "plain_text", text: initial[name].select }, value: initial[name].select }
-          : undefined;
-
+      case "select":
         blocks.push({
           type: "input",
           block_id,
@@ -90,21 +164,17 @@ function renderProps({ A, props, meta, initial }) {
           element: {
             type: "static_select",
             action_id,
-            options,
-            initial_option
+            options: (prop.select?.options || []).map(o => ({
+              text: { type: "plain_text", text: o.name }, value: o.name
+            })),
+            initial_option: initial?.[name]?.select
+              ? { text: { type: "plain_text", text: initial[name].select }, value: initial[name].select }
+              : undefined
           }
         });
         break;
-      }
 
-      case "multi_select": {
-        const options = (prop.multi_select?.options || []).map(o => ({
-          text: { type: "plain_text", text: o.name }, value: o.name
-        }));
-        const initial_options = (initial?.[name]?.multi_select || []).map(v => ({
-          text: { type: "plain_text", text: v }, value: v
-        }));
-
+      case "multi_select":
         blocks.push({
           type: "input",
           block_id,
@@ -112,14 +182,17 @@ function renderProps({ A, props, meta, initial }) {
           element: {
             type: "multi_static_select",
             action_id,
-            options,
-            initial_options
+            options: (prop.multi_select?.options || []).map(o => ({
+              text: { type: "plain_text", text: o.name }, value: o.name
+            })),
+            initial_options: (initial?.[name]?.multi_select || []).map(v => ({
+              text: { type: "plain_text", text: v }, value: v
+            }))
           }
         });
         break;
-      }
 
-      case "date": {
+      case "date":
         blocks.push({
           type: "input",
           block_id,
@@ -131,9 +204,8 @@ function renderProps({ A, props, meta, initial }) {
           }
         });
         break;
-      }
 
-      case "checkbox": {
+      case "checkbox":
         blocks.push({
           type: "input",
           block_id,
@@ -142,20 +214,14 @@ function renderProps({ A, props, meta, initial }) {
             type: "checkboxes",
             action_id,
             options: [{ text: { type: "plain_text", text: "Checked" }, value: "true" }],
-            initial_options: initial?.[name]?.checkbox ? [{ text: { type: "plain_text", text: "Checked" }, value: "true" }] : undefined
+            initial_options: initial?.[name]?.checkbox
+              ? [{ text: { type: "plain_text", text: "Checked" }, value: "true" }]
+              : undefined
           }
         });
         break;
-      }
 
-      case "status": {
-        const options = (prop.status?.options || []).map(o => ({
-          text: { type: "plain_text", text: o.name }, value: o.name
-        }));
-        const initial_option = initial?.[name]?.status
-          ? { text: { type: "plain_text", text: initial[name].status }, value: initial[name].status }
-          : undefined;
-
+      case "status":
         blocks.push({
           type: "input",
           block_id,
@@ -163,15 +229,17 @@ function renderProps({ A, props, meta, initial }) {
           element: {
             type: "static_select",
             action_id,
-            options,
-            initial_option
+            options: (prop.status?.options || []).map(o => ({
+              text: { type: "plain_text", text: o.name }, value: o.name
+            })),
+            initial_option: initial?.[name]?.status
+              ? { text: { type: "plain_text", text: initial[name].status }, value: initial[name].status }
+              : undefined
           }
         });
         break;
-      }
 
-      case "relation": {
-        // dynamic external_select; options handler leerá meta.relations[propName]
+      case "relation":
         blocks.push({
           type: "input",
           block_id,
@@ -181,20 +249,20 @@ function renderProps({ A, props, meta, initial }) {
             action_id,
             min_query_length: 0,
             placeholder: { type: "plain_text", text: "Search related pages..." },
-            initial_option: initial?.[name]?.relation ?
-              {
-                text: { type: "plain_text", text: initial[name].relation.title || initial[name].relation.id },
-                value: initial[name].relation.id
-              } : undefined
+            initial_option: initial?.[name]?.relation
+              ? {
+                  text: { type: "plain_text", text: initial[name].relation.title || initial[name].relation.id },
+                  value: initial[name].relation.id
+                }
+              : undefined
           }
         });
         break;
-      }
     }
   }
 
   if (!blocks.length) {
-    blocks.push({ type: "section", text: { type: "mrkdwn", text: "_No editable fields found in this database._" } });
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: "_No editable fields found for your selection._" } });
   }
 
   return blocks;
@@ -205,51 +273,28 @@ function convertPageToInitials(page) {
   const props = page?.properties || {};
   for (const [name, prop] of Object.entries(props)) {
     switch (prop.type) {
-      case "title":
-        out[name] = { text: prop.title?.[0]?.plain_text || "" };
-        break;
-      case "rich_text":
-        out[name] = { text: prop.rich_text?.[0]?.plain_text || "" };
-        break;
-      case "number":
-        out[name] = { text: (prop.number ?? "").toString() };
-        break;
-      case "url":
-        out[name] = { text: prop.url || "" };
-        break;
-      case "email":
-        out[name] = { text: prop.email || "" };
-        break;
-      case "phone_number":
-        out[name] = { text: prop.phone_number || "" };
-        break;
-      case "select":
-        out[name] = { select: prop.select?.name || "" };
-        break;
-      case "multi_select":
-        out[name] = { multi_select: (prop.multi_select || []).map(o => o.name) };
-        break;
-      case "date":
-        out[name] = { date: prop.date?.start || undefined };
-        break;
-      case "checkbox":
-        out[name] = { checkbox: !!prop.checkbox };
-        break;
-      case "status":
-        out[name] = { status: prop.status?.name || "" };
-        break;
+      case "title": out[name] = { text: prop.title?.[0]?.plain_text || "" }; break;
+      case "rich_text": out[name] = { text: prop.rich_text?.[0]?.plain_text || "" }; break;
+      case "number": out[name] = { text: (prop.number ?? "").toString() }; break;
+      case "url": out[name] = { text: prop.url || "" }; break;
+      case "email": out[name] = { text: prop.email || "" }; break;
+      case "phone_number": out[name] = { text: prop.phone_number || "" }; break;
+      case "select": out[name] = { select: prop.select?.name || "" }; break;
+      case "multi_select": out[name] = { multi_select: (prop.multi_select || []).map(o => o.name) }; break;
+      case "date": out[name] = { date: prop.date?.start || undefined }; break;
+      case "checkbox": out[name] = { checkbox: !!prop.checkbox }; break;
+      case "status": out[name] = { status: prop.status?.name || "" }; break;
       case "relation":
-        // tomamos el primero como initial (ajustable a multi)
         const first = (prop.relation || [])[0];
         if (first) out[name] = { relation: { id: first.id, title: first.id } };
-        break;
-      default:
         break;
     }
   }
   return out;
 }
+exports.convertPageToInitials = convertPageToInitials;
 
+/** ---------- Parse del submit ---------- */
 exports.parseSubmission = ({ values, props }) => {
   const out = {};
 
@@ -282,9 +327,7 @@ exports.parseSubmission = ({ values, props }) => {
         out[name] = { select: slot.selected_option ? { name: slot.selected_option.value } : null };
         break;
       case "multi_select":
-        out[name] = {
-          multi_select: (slot.selected_options || []).map(o => ({ name: o.value }))
-        };
+        out[name] = { multi_select: (slot.selected_options || []).map(o => ({ name: o.value })) };
         break;
       case "date":
         out[name] = { date: slot.selected_date ? { start: slot.selected_date } : null };
@@ -296,14 +339,11 @@ exports.parseSubmission = ({ values, props }) => {
         out[name] = { status: slot.selected_option ? { name: slot.selected_option.value } : null };
         break;
       case "relation":
-        if (slot.selected_option?.value) {
-          out[name] = { relation: [{ id: slot.selected_option.value }] };
-        }
-        break;
-      default:
+        if (slot.selected_option?.value) out[name] = { relation: [{ id: slot.selected_option.value }] };
         break;
     }
   }
 
   return out;
 };
+
