@@ -1,0 +1,15 @@
+{
+  "name": "slack-notion",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "PORT=3000 node index.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.17.0",
+    "node-fetch": "^3.3.2",
+    "dotenv": "^16.4.5"
+  }
+}
