@@ -51,16 +51,23 @@ const VIEW = {
   EDIT_FORM: "v_edit_form",
 };
 
-// Permite configurar el Callback ID del shortcut por env (default: push_to_notion)
+// Callback del shortcut (permite override por env)
 const SHORTCUT_ID = process.env.SLACK_SHORTCUT_ID || "push_to_notion";
 
 /** ====== Shortcut: abre Step 1 ====== */
 app.shortcut(SHORTCUT_ID, async ({ shortcut, ack, client }) => {
-  // Ack inmediato para evitar timeouts (499)
+  // Ack inmediato para evitar timeouts
   await ack();
 
   try {
     console.log("shortcut received:", shortcut.callback_id);
+
+    // Si el atajo es de mensaje, tomamos el contenido del mensaje para el Title (Create/Subtask)
+    const prefillTitleRaw = (shortcut && shortcut.message && shortcut.message.text) ? shortcut.message.text : "";
+    const prefillTitle = prefillTitleRaw
+      ? prefillTitleRaw.replace(/\n+/g, " ").trim().slice(0, 200)
+      : "";
+
     await client.views.open({
       trigger_id: shortcut.trigger_id,
       view: {
@@ -68,7 +75,8 @@ app.shortcut(SHORTCUT_ID, async ({ shortcut, ack, client }) => {
         callback_id: VIEW.STEP1,
         title: { type: "plain_text", text: "Push to Notion" },
         submit: { type: "plain_text", text: "Continue" },
-        private_metadata: JSON.stringify({ step: 1 }),
+        // Guardamos el posible título autollenado en private_metadata
+        private_metadata: JSON.stringify({ step: 1, prefillTitle }),
         blocks: [
           {
             type: "input",
@@ -119,7 +127,7 @@ app.options(A.PAGE, async ({ options, ack, body }) => {
   try { md = JSON.parse(body?.view?.private_metadata || "{}"); } catch {}
   const query = options.value || "";
   const dbId = md.database_id;
-  const pages = await notion.searchPagesInDatabase(dbId, query); // títulos reales
+  const pages = await notion.searchPagesInDatabase(dbId, query);
   const opts = pages.slice(0, 100).map(p => ({
     text: { type: "plain_text", text: p.title || p.id },
     value: p.id
@@ -147,9 +155,13 @@ app.options(/prop::/, async ({ options, ack, body }) => {
 
 /** ====== STEP1 -> ramifica a CREATE / EDIT / SUBTASK ====== */
 app.view(VIEW.STEP1, async ({ ack, view }) => {
+  let md = {};
+  try { md = JSON.parse(view.private_metadata || "{}"); } catch {}
+
   const state = view.state.values;
   const mode = state[A.MODE]?.[A.MODE]?.selected_option?.value;
   const database_id = state[A.DB]?.[A.DB]?.selected_option?.value;
+  const prefillTitle = md.prefillTitle || "";
 
   if (!mode || !database_id) {
     return ack({
@@ -164,10 +176,10 @@ app.view(VIEW.STEP1, async ({ ack, view }) => {
   try {
     const dbProps = await notion.getDatabaseProperties(database_id);
     const relations = collectRelationTargets(dbProps);
-    const meta = { mode, database_id, relations };
+    const baseMeta = { mode, database_id, relations, prefillTitle };
 
     if (mode === "edit") {
-      const blocks = buildEditSelectBlocks({ A, meta });
+      const blocks = buildEditSelectBlocks({ A, label: "Page" });
       return ack({
         response_action: "update",
         view: {
@@ -175,14 +187,14 @@ app.view(VIEW.STEP1, async ({ ack, view }) => {
           callback_id: VIEW.EDIT_PICK,
           title: { type: "plain_text", text: "Edit page" },
           submit: { type: "plain_text", text: "Load" },
-          private_metadata: JSON.stringify(meta),
+          private_metadata: JSON.stringify(baseMeta),
           blocks
         }
       });
     }
 
     if (mode === "subtask") {
-      const blocks = buildEditSelectBlocks({ A, meta, label: "Parent page" });
+      const blocks = buildEditSelectBlocks({ A, label: "Parent page" });
       return ack({
         response_action: "update",
         view: {
@@ -190,17 +202,18 @@ app.view(VIEW.STEP1, async ({ ack, view }) => {
           callback_id: VIEW.EDIT_PICK,
           title: { type: "plain_text", text: "Add Subtask" },
           submit: { type: "plain_text", text: "Continue" },
-          private_metadata: JSON.stringify({ ...meta, mode: "subtask" }),
+          private_metadata: JSON.stringify({ ...baseMeta, mode: "subtask" }),
           blocks
         }
       });
     }
 
-    // CREATE: renderiza todas las props (solo Title requerido)
+    // CREATE: Title obligatorio, autollenado con prefillTitle
     const blocks = buildCreateOrEditBlocks({
       A,
       props: dbProps,
       mode: "create",
+      prefillTitle, // <-- autollenado
     });
 
     return ack({
@@ -210,7 +223,7 @@ app.view(VIEW.STEP1, async ({ ack, view }) => {
         callback_id: VIEW.CREATE_FORM,
         title: { type: "plain_text", text: "Create page" },
         submit: { type: "plain_text", text: "Create" },
-        private_metadata: JSON.stringify(meta),
+        private_metadata: JSON.stringify(baseMeta),
         blocks
       }
     });
@@ -227,7 +240,7 @@ app.view(VIEW.STEP1, async ({ ack, view }) => {
 app.view(VIEW.EDIT_PICK, async ({ ack, view }) => {
   let md = {};
   try { md = JSON.parse(view.private_metadata || "{}"); } catch {}
-  const { mode, database_id } = md;
+  const { mode, database_id, prefillTitle } = md;
 
   const page_id = view.state.values?.[A.PAGE]?.[A.PAGE]?.selected_option?.value;
 
@@ -247,7 +260,8 @@ app.view(VIEW.EDIT_PICK, async ({ ack, view }) => {
         A,
         props: dbProps,
         mode: "edit",
-        initialPage: page, // prefill
+        initialPage: page,   // prefill desde la página
+        // sin prefillTitle en Edit
       });
       return ack({
         response_action: "update",
@@ -262,11 +276,12 @@ app.view(VIEW.EDIT_PICK, async ({ ack, view }) => {
       });
     }
 
-    // SUBTASK: formulario vacío (sin snapshot ni prefills), pero luego enlazamos al parent
+    // SUBTASK: Title obligatorio y autollenado con prefillTitle
     const blocks = buildCreateOrEditBlocks({
       A,
       props: dbProps,
       mode: "subtask",
+      prefillTitle,  // <-- autollenado
     });
 
     return ack({
