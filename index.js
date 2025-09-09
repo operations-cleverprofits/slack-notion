@@ -1,324 +1,96 @@
-require("dotenv").config();
-const { App, ExpressReceiver } = require("@slack/bolt");
-const notion = require("./notion");
-const {
-  buildCreateBlocks,
-  buildEditSelectBlocks,
-  buildEditBlocks,
-  parseSubmission,
-  collectRelationTargets,
-} = require("./blocks");
+const fetch = (...a) => import("node-fetch").then(({ default: f }) => f(...a));
 
-const receiver = new ExpressReceiver({
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
-  processBeforeResponse: true,
-});
-
-// Healthchecks
-receiver.app.get("/", (_req, res) => res.status(200).send("OK - Slack ↔ Notion"));
-receiver.app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
-
-const app = new App({
-  token: process.env.SLACK_BOT_TOKEN,
-  receiver,
-});
-
-/** ====== Constantes de acción/ids ====== */
-const A = {
-  MODE: "mode_select",            // create | edit | subtask
-  DB: "db_select",
-  PAGE: "page_select",
-  // Cada propiedad dinámica tendrá action_id = "prop::<name>"
-  PROP_PREFIX: "prop::",
+const API = "https://api.notion.com/v1";
+const headers = {
+  "Authorization": `Bearer ${process.env.NOTION_TOKEN}`,
+  "Notion-Version": "2022-06-28",
+  "Content-Type": "application/json",
 };
 
-const VIEW = {
-  STEP1: "v_step1",
-  CREATE_FORM: "v_create_form",
-  EDIT_PICK: "v_edit_pick",
-  EDIT_FORM: "v_edit_form",
+exports.searchDatabases = async (query = "") => {
+  const r = await fetch(`${API}/search`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      query,
+      filter: { property: "object", value: "database" },
+      sort: { direction: "descending", timestamp: "last_edited_time" }
+    })
+  });
+  const j = await r.json();
+  return (j.results || []).map(db => ({
+    id: db.id,
+    title: db.title?.[0]?.plain_text || db.id
+  }));
 };
 
-/** ====== Shortcut: abre Step 1 ====== */
-app.shortcut("push_to_notion", async ({ shortcut, ack, client }) => {
-  await ack();
-  await client.views.open({
-    trigger_id: shortcut.trigger_id,
-    view: {
-      type: "modal",
-      callback_id: VIEW.STEP1,
-      title: { type: "plain_text", text: "Push to Notion" },
-      submit: { type: "plain_text", text: "Continue" },
-      private_metadata: JSON.stringify({ step: 1 }),
-      blocks: [
-        {
-          type: "input",
-          block_id: A.MODE,
-          label: { type: "plain_text", text: "Action" },
-          element: {
-            type: "static_select",
-            action_id: A.MODE,
-            options: [
-              { text: { type: "plain_text", text: "Create" }, value: "create" },
-              { text: { type: "plain_text", text: "Edit" }, value: "edit" },
-              { text: { type: "plain_text", text: "Add Subtask" }, value: "subtask" }
-            ]
-          }
-        },
-        {
-          type: "input",
-          block_id: A.DB,
-          label: { type: "plain_text", text: "Database" },
-          element: {
-            type: "external_select",
-            action_id: A.DB,
-            min_query_length: 0,
-            placeholder: { type: "plain_text", text: "Search databases..." }
-          }
-        }
-      ]
-    }
+exports.getDatabaseProperties = async (database_id) => {
+  const r = await fetch(`${API}/databases/${database_id}`, { headers });
+  const db = await r.json();
+  return db.properties || {};
+};
+
+async function getDatabaseTitleKey(database_id) {
+  const r = await fetch(`${API}/databases/${database_id}`, { headers });
+  const db = await r.json();
+  const props = db.properties || {};
+  for (const [name, prop] of Object.entries(props)) {
+    if (prop.type === "title") return name; // ej: "Name", "Client Name", etc.
+  }
+  return "Name"; // fallback común
+}
+exports.getDatabaseTitleKey = getDatabaseTitleKey;
+
+exports.searchPagesInDatabase = async (database_id, query = "") => {
+  // Determina la propiedad de título real de la DB
+  const titleKey = await getDatabaseTitleKey(database_id);
+
+  const r = await fetch(`${API}/search`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      query,
+      filter: { property: "object", value: "page" },
+      sort: { direction: "descending", timestamp: "last_edited_time" }
+    })
   });
-});
+  const j = await r.json();
 
-/** ====== Options (DB / Pages / Relations) ======
- * Slack llamará a estos handlers cuando el usuario tipee en external_select
- */
-app.options(A.DB, async ({ options, ack }) => {
-  const query = options.value || "";
-  const dbs = await notion.searchDatabases(query);
-  const opts = dbs.slice(0, 100).map(db => ({
-    text: { type: "plain_text", text: db.title || db.id },
-    value: db.id
-  }));
-  await ack({ options: opts });
-});
+  const inDb = (j.results || []).filter(p => p.parent?.database_id === database_id);
 
-app.options(A.PAGE, async ({ options, ack, body }) => {
-  // body.view.private_metadata guarda el database_id
-  let md = {};
-  try { md = JSON.parse(body?.view?.private_metadata || "{}"); } catch {}
-  const query = options.value || "";
-  const dbId = md.database_id;
-  const pages = await notion.searchPagesInDatabase(dbId, query);
-  const opts = pages.slice(0, 100).map(p => ({
-    text: { type: "plain_text", text: p.title || p.id },
-    value: p.id
-  }));
-  await ack({ options: opts });
-});
+  return inDb.map(p => {
+    const tProp = p.properties?.[titleKey];
+    const title =
+      tProp?.type === "title" ? (tProp.title?.[0]?.plain_text || p.id) :
+      p.properties?.Name?.title?.[0]?.plain_text ||
+      p.properties?.name?.title?.[0]?.plain_text ||
+      p.id;
 
-app.options(/prop::/, async ({ options, ack, body }) => {
-  // Relations: el action_id será "prop::<propName>"
-  const actionId = options?.action_id || "";
-  const propName = String(actionId).replace("prop::", "");
-  let md = {};
-  try { md = JSON.parse(body?.view?.private_metadata || "{}"); } catch {}
-
-  const relatedDbId = md?.relations?.[propName];
-  if (!relatedDbId) return ack({ options: [] });
-
-  const query = options.value || "";
-  const pages = await notion.searchPagesInDatabase(relatedDbId, query);
-  const opts = pages.slice(0, 100).map(p => ({
-    text: { type: "plain_text", text: p.title || p.id },
-    value: p.id
-  }));
-  await ack({ options: opts });
-});
-
-/** ====== Submit Step 1 -> ramifica a CREATE / EDIT / SUBTASK ====== */
-app.view(VIEW.STEP1, async ({ ack, view }) => {
-  // Lee selección del usuario
-  const state = view.state.values;
-  const mode = state[A.MODE]?.[A.MODE]?.selected_option?.value;
-  const database_id = state[A.DB]?.[A.DB]?.selected_option?.value;
-
-  // Validación: si falta algo, muestra error en el propio modal
-  if (!mode || !database_id) {
-    return ack({
-      response_action: "errors",
-      errors: {
-        [A.MODE]: !mode ? "Select an action." : undefined,
-        [A.DB]: !database_id ? "Select a database." : undefined,
-      },
-    });
-  }
-
-  try {
-    // Cargamos propiedades de la DB
-    const dbProps = await notion.getDatabaseProperties(database_id);
-    const relations = collectRelationTargets(dbProps); // { [propName]: relatedDatabaseId }
-    const meta = { mode, database_id, relations };
-
-    if (mode === "edit") {
-      // Pedir selección de página y luego cargar valores
-      const blocks = buildEditSelectBlocks({ A, meta });
-      return ack({
-        response_action: "update",
-        view: {
-          type: "modal",
-          callback_id: VIEW.EDIT_PICK,
-          title: { type: "plain_text", text: "Edit page" },
-          submit: { type: "plain_text", text: "Load" },
-          private_metadata: JSON.stringify(meta),
-          blocks
-        }
-      });
-    }
-
-    if (mode === "subtask") {
-      // Primero pedimos el parent page, luego mostramos propiedades
-      const blocks = buildEditSelectBlocks({ A, meta, label: "Parent page" });
-      return ack({
-        response_action: "update",
-        view: {
-          type: "modal",
-          callback_id: VIEW.EDIT_PICK, // reutilizamos handler para cargar luego el form
-          title: { type: "plain_text", text: "Add Subtask" },
-          submit: { type: "plain_text", text: "Continue" },
-          private_metadata: JSON.stringify({ ...meta, mode: "subtask" }),
-          blocks
-        }
-      });
-    }
-
-    // CREATE directamente: renderizar propiedades vacías
-    const blocks = buildCreateBlocks({ A, props: dbProps, meta });
-    return ack({
-      response_action: "update",
-      view: {
-        type: "modal",
-        callback_id: VIEW.CREATE_FORM,
-        title: { type: "plain_text", text: "Create page" },
-        submit: { type: "plain_text", text: "Create" },
-        private_metadata: JSON.stringify(meta),
-        blocks
-      }
-    });
-  } catch (e) {
-    console.error("STEP1 error:", e);
-    return ack({
-      response_action: "errors",
-      errors: { [A.DB]: "I couldn’t load this database. Check access and try again." },
-    });
-  }
-});
-
-/** ====== Submit: elegir página (EDIT) o elegir parent (SUBTASK) -> cargar form ====== */
-app.view(VIEW.EDIT_PICK, async ({ ack, view }) => {
-  let md = {};
-  try { md = JSON.parse(view.private_metadata || "{}"); } catch {}
-  const { mode, database_id } = md;
-
-  const state = view.state.values;
-  const page_id = state?.[A.PAGE]?.[A.PAGE]?.selected_option?.value;
-
-  if (!page_id) {
-    return ack({
-      response_action: "errors",
-      errors: { [A.PAGE]: "Select a page." },
-    });
-  }
-
-  try {
-    const dbProps = await notion.getDatabaseProperties(database_id);
-
-    if (mode === "edit") {
-      const page = await notion.getPage(page_id);
-      const blocks = buildEditBlocks({ A, props: dbProps, page, meta: { ...md, page_id } });
-      return ack({
-        response_action: "update",
-        view: {
-          type: "modal",
-          callback_id: VIEW.EDIT_FORM,
-          title: { type: "plain_text", text: "Edit page" },
-          submit: { type: "plain_text", text: "Update" },
-          private_metadata: JSON.stringify({ ...md, page_id }),
-          blocks
-        }
-      });
-    }
-
-    // SUBTASK: form de creación con relación al parent pre-establecida
-    const blocks = buildCreateBlocks({
-      A,
-      props: dbProps,
-      meta: { ...md, parent_page_id: page_id, as_subtask: true }
-    });
-
-    return ack({
-      response_action: "update",
-      view: {
-        type: "modal",
-        callback_id: VIEW.CREATE_FORM,
-        title: { type: "plain_text", text: "Add Subtask" },
-        submit: { type: "plain_text", text: "Create" },
-        private_metadata: JSON.stringify({ ...md, parent_page_id: page_id, as_subtask: true }),
-        blocks
-      }
-    });
-  } catch (e) {
-    console.error("EDIT_PICK error:", e);
-    return ack({
-      response_action: "errors",
-      errors: { [A.PAGE]: "Couldn’t load the page or database. Try again." },
-    });
-  }
-});
-
-/** ====== Submit: CREATE o EDIT final ====== */
-app.view(VIEW.CREATE_FORM, async ({ ack, body, view, client }) => {
-  await ack();
-  let md = {};
-  try { md = JSON.parse(view.private_metadata || "{}"); } catch {}
-  const { database_id, as_subtask, parent_page_id } = md;
-
-  const dbProps = await notion.getDatabaseProperties(database_id);
-  const properties = parseSubmission({ values: view.state.values, props: dbProps });
-
-  // Si es subtask, intenta setear relación padre (sub-items nativos o self-relation)
-  if (as_subtask) {
-    // Heurística: busca una relación self-relation llamada "Parent" o cualquier relation hacia la misma DB
-    const parentRel = Object.entries(dbProps).find(([name, p]) =>
-      p?.type === "relation" && (p.relation?.database_id === database_id)
-    );
-    if (parentRel) {
-      const [propName] = parentRel;
-      properties[propName] = { relation: [{ id: parent_page_id }] };
-    }
-  }
-
-  const page = await notion.createPage(database_id, properties);
-
-  await client.chat.postEphemeral({
-    channel: body.user.id,
-    user: body.user.id,
-    text: `✅ Created: ${page?.url || "Notion page"}`
+    return { id: p.id, title, url: p.url };
   });
-});
+};
 
-app.view(VIEW.EDIT_FORM, async ({ ack, body, view, client }) => {
-  await ack();
-  let md = {};
-  try { md = JSON.parse(view.private_metadata || "{}"); } catch {}
-  const { database_id, page_id } = md;
-
-  const dbProps = await notion.getDatabaseProperties(database_id);
-  const properties = parseSubmission({ values: view.state.values, props: dbProps });
-
-  const updated = await notion.updatePage(page_id, properties);
-
-  await client.chat.postEphemeral({
-    channel: body.user.id,
-    user: body.user.id,
-    text: `✏️ Updated: ${updated?.url || "Notion page"}`
+exports.createPage = async (database_id, properties) => {
+  const r = await fetch(`${API}/pages`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ parent: { database_id }, properties })
   });
-});
+  return r.json();
+};
 
-/** ====== Start ====== */
-(async () => {
-  await app.start(process.env.PORT || 3000);
-  console.log("⚡️ Slack ↔ Notion running on port", process.env.PORT || 3000);
-})();
+exports.updatePage = async (page_id, properties) => {
+  const r = await fetch(`${API}/pages/${page_id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ properties })
+  });
+  return r.json();
+};
+
+exports.getPage = async (page_id) => {
+  const r = await fetch(`${API}/pages/${page_id}`, { headers });
+  return r.json();
+};
+
 
