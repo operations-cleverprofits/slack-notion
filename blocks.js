@@ -1,4 +1,10 @@
-/** Render helpers para Slack Blocks ←→ Notion */
+/** Render helpers para Slack Blocks ←→ Notion
+ * Reglas:
+ * - Create: solo Title es obligatorio; el resto es opcional.
+ * - Edit y Subtask: todos los campos son opcionales.
+ * - Subtask: el label del título se muestra como "Subtask Title".
+ * - Orden: respetamos el orden que entrega Notion (title primero).
+ */
 
 const READONLY_TYPES = new Set([
   "formula", "rollup", "created_time", "last_edited_time",
@@ -7,11 +13,7 @@ const READONLY_TYPES = new Set([
 
 const isEditable = (prop) => !READONLY_TYPES.has(prop.type);
 
-/**
- * Orden: respetamos el orden de llegada del esquema de Notion.
- * - Title primero (si existe).
- * - Luego el resto en el orden enumerado por la API.
- */
+/** Ordena: Title primero (si existe) y luego el resto en el orden recibido */
 const orderPropertyEntries = (props) => {
   const entries = Object.entries(props || {});
   let titleKey = null;
@@ -22,6 +24,7 @@ const orderPropertyEntries = (props) => {
   return titleKey ? [[titleKey, props[titleKey]], ...rest] : entries;
 };
 
+/** Mapa de relaciones: { propName: relatedDatabaseId } */
 exports.collectRelationTargets = (props) => {
   const rels = {};
   for (const [name, prop] of Object.entries(props || {})) {
@@ -32,29 +35,26 @@ exports.collectRelationTargets = (props) => {
   return rels;
 };
 
-/**
- * Crea bloques para Create/Edit/Subtask con estas reglas:
- * - Create: todos los campos, pero SOLO Title es requerido. El resto es optional.
- * - Edit/Subtask: TODOS los campos optional.
- * - Orden de propiedades conforme a Notion (title primero).
- * - initialPage (opcional) para prefill en Edit.
- */
+/** Construye bloques para Create/Edit/Subtask (con las reglas de obligatoriedad) */
 exports.buildCreateOrEditBlocks = ({ A, props, mode, initialPage = null }) => {
   const initial = initialPage ? convertPageToInitials(initialPage) : null;
-  const requireTitle = mode === "create";
-  const allOptional = mode !== "create";
 
   const blocks = [];
+  const isCreate = mode === "create";
+  const isSubtask = mode === "subtask";
 
   for (const [name, prop] of orderPropertyEntries(props)) {
     if (!isEditable(prop)) continue;
 
     const isTitle = prop.type === "title";
-    const optional = isTitle ? !requireTitle : allOptional;
+    // Create: solo Title requerido; Edit/Subtask: todo opcional
+    const optional = isCreate ? !isTitle : true;
+    // En Subtask renombramos el label del Title
+    const labelText = (isSubtask && isTitle) ? "Subtask Title" : name;
 
     const action_id = `prop::${name}`;
     const block_id = action_id;
-    const label = { type: "plain_text", text: name };
+    const label = { type: "plain_text", text: labelText };
 
     switch (prop.type) {
       case "title":
@@ -195,7 +195,8 @@ exports.buildCreateOrEditBlocks = ({ A, props, mode, initialPage = null }) => {
   return blocks;
 };
 
-exports.buildEditSelectBlocks = ({ A, meta, label = "Page" }) => ([
+/** Selector de página para Edit/Subtask */
+exports.buildEditSelectBlocks = ({ A, label = "Page" }) => ([
   {
     type: "input",
     block_id: A.PAGE,
@@ -209,7 +210,7 @@ exports.buildEditSelectBlocks = ({ A, meta, label = "Page" }) => ([
   }
 ]);
 
-/** ---------- Parse del submit ---------- */
+/** Convierte el formulario de Slack → propiedades de Notion (solo lo que el usuario tocó) */
 exports.parseSubmission = ({ values, props }) => {
   const out = {};
 
@@ -217,7 +218,7 @@ exports.parseSubmission = ({ values, props }) => {
     if (!isEditable(prop)) continue;
     const key = `prop::${name}`;
     const slot = values?.[key]?.[key];
-    if (!slot) continue; // si no se tocó, no enviamos nada
+    if (!slot) continue; // si no se tocó, no se envía
 
     switch (prop.type) {
       case "title":
@@ -262,7 +263,7 @@ exports.parseSubmission = ({ values, props }) => {
   return out;
 };
 
-/** ---------- Util: convertir Page → initial values ---------- */
+/** Page → valores iniciales para inputs de Slack */
 function convertPageToInitials(page) {
   const out = {};
   const props = page?.properties || {};
