@@ -1,7 +1,7 @@
 /** Render helpers para Slack Blocks ←→ Notion
  * Reglas:
- * - Create: solo Title es obligatorio; el resto es opcional.
- * - Edit y Subtask: todos los campos son opcionales.
+ * - Title es obligatorio en TODOS los modos (create, edit, subtask).
+ * - Resto de campos siempre opcionales.
  * - Subtask: el label del título se muestra como "Subtask Title".
  * - Orden: respetamos el orden que entrega Notion (title primero).
  */
@@ -35,26 +35,32 @@ exports.collectRelationTargets = (props) => {
   return rels;
 };
 
-/** Construye bloques para Create/Edit/Subtask (con las reglas de obligatoriedad) */
-exports.buildCreateOrEditBlocks = ({ A, props, mode, initialPage = null }) => {
+/**
+ * Construye bloques para Create/Edit/Subtask.
+ * - Title obligatorio en todos los modos.
+ * - Autollenado de Title: usa (en orden) initialPage → prefillTitle → vacío.
+ */
+exports.buildCreateOrEditBlocks = ({ A, props, mode, initialPage = null, prefillTitle = "" }) => {
   const initial = initialPage ? convertPageToInitials(initialPage) : null;
 
   const blocks = [];
-  const isCreate = mode === "create";
   const isSubtask = mode === "subtask";
 
   for (const [name, prop] of orderPropertyEntries(props)) {
     if (!isEditable(prop)) continue;
 
     const isTitle = prop.type === "title";
-    // Create: solo Title requerido; Edit/Subtask: todo opcional
-    const optional = isCreate ? !isTitle : true;
+    // Title SIEMPRE requerido; resto opcional
+    const optional = !isTitle;
     // En Subtask renombramos el label del Title
     const labelText = (isSubtask && isTitle) ? "Subtask Title" : name;
 
     const action_id = `prop::${name}`;
     const block_id = action_id;
     const label = { type: "plain_text", text: labelText };
+
+    // Valor inicial del Title: initial → prefillTitle → undefined
+    const titleInitialValue = initial?.[name]?.text ?? (isTitle ? (prefillTitle || undefined) : undefined);
 
     switch (prop.type) {
       case "title":
@@ -72,7 +78,7 @@ exports.buildCreateOrEditBlocks = ({ A, props, mode, initialPage = null }) => {
             type: "plain_text_input",
             action_id,
             multiline: prop.type === "rich_text",
-            initial_value: initial?.[name]?.text ?? undefined
+            initial_value: isTitle ? titleInitialValue : (initial?.[name]?.text ?? undefined)
           }
         });
         break;
@@ -289,5 +295,6 @@ function convertPageToInitials(page) {
   return out;
 }
 exports.convertPageToInitials = convertPageToInitials;
+
 
 
