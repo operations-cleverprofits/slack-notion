@@ -14,15 +14,12 @@ const receiver = new ExpressReceiver({
   processBeforeResponse: true,
 });
 
-// Logs de tráfico para debug
 receiver.app.use((req, _res, next) => {
   if (req.path === "/slack/events") {
     console.log("[/slack/events] incoming", new Date().toISOString(), req.method);
   }
   next();
 });
-
-// Healthchecks
 receiver.app.get("/", (_req, res) => res.status(200).send("OK - Slack ↔ Notion"));
 receiver.app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
 
@@ -42,6 +39,7 @@ const A = {
   DB: "db_select",
   PAGE: "page_select",
   PROP_PREFIX: "prop::",
+  COPY_LINK: "copy_link",
 };
 
 const VIEW = {
@@ -51,22 +49,49 @@ const VIEW = {
   EDIT_FORM: "v_edit_form",
 };
 
-// Callback del shortcut (permite override por env)
 const SHORTCUT_ID = process.env.SLACK_SHORTCUT_ID || "push_to_notion";
 
-/** ====== Shortcut: abre Step 1 ====== */
+/** Helper: bloque con permalink + botón copiar */
+function buildPermalinkBlock(permalink) {
+  if (!permalink) return [];
+  return [{
+    type: "section",
+    text: {
+      type: "mrkdwn",
+      text: `*Message link:* <${permalink}|Open message>`
+    },
+    accessory: {
+      type: "button",
+      text: { type: "plain_text", text: "Copy link" },
+      action_id: A.COPY_LINK,
+      value: permalink
+    }
+  }];
+}
+
+/** ====== Shortcut ====== */
 app.shortcut(SHORTCUT_ID, async ({ shortcut, ack, client }) => {
-  // Ack inmediato para evitar timeouts
   await ack();
 
   try {
-    console.log("shortcut received:", shortcut.callback_id);
+    const textRaw = shortcut?.message?.text || "";
+    const prefillTitle = textRaw ? textRaw.replace(/\n+/g, " ").trim().slice(0, 200) : "";
 
-    // Si el atajo es de mensaje, tomamos el contenido del mensaje para el Title (Create/Subtask)
-    const prefillTitleRaw = (shortcut && shortcut.message && shortcut.message.text) ? shortcut.message.text : "";
-    const prefillTitle = prefillTitleRaw
-      ? prefillTitleRaw.replace(/\n+/g, " ").trim().slice(0, 200)
-      : "";
+    // permalink del mensaje (si viene de message shortcut)
+    let permalink = "";
+    const channel_id = shortcut?.channel?.id;
+    const message_ts = shortcut?.message?.ts;
+    if (channel_id && message_ts) {
+      try {
+        const { permalink: link } = await client.chat.getPermalink({
+          channel: channel_id,
+          message_ts
+        });
+        permalink = link || "";
+      } catch (e) {
+        console.warn("getPermalink failed:", e?.data || e);
+      }
+    }
 
     await client.views.open({
       trigger_id: shortcut.trigger_id,
@@ -75,8 +100,13 @@ app.shortcut(SHORTCUT_ID, async ({ shortcut, ack, client }) => {
         callback_id: VIEW.STEP1,
         title: { type: "plain_text", text: "Push to Notion" },
         submit: { type: "plain_text", text: "Continue" },
-        // Guardamos el posible título autollenado en private_metadata
-        private_metadata: JSON.stringify({ step: 1, prefillTitle }),
+        private_metadata: JSON.stringify({
+          step: 1,
+          prefillTitle,
+          permalink,
+          channel_id,
+          message_ts
+        }),
         blocks: [
           {
             type: "input",
@@ -102,7 +132,8 @@ app.shortcut(SHORTCUT_ID, async ({ shortcut, ack, client }) => {
               min_query_length: 0,
               placeholder: { type: "plain_text", text: "Search databases..." }
             }
-          }
+          },
+          ...buildPermalinkBlock(permalink),
         ]
       }
     });
@@ -153,7 +184,28 @@ app.options(/prop::/, async ({ options, ack, body }) => {
   await ack({ options: opts });
 });
 
-/** ====== STEP1 -> ramifica a CREATE / EDIT / SUBTASK ====== */
+/** ====== Botón "Copy link" ====== */
+app.action(A.COPY_LINK, async ({ ack, body, client }) => {
+  await ack();
+  let md = {};
+  try { md = JSON.parse(body?.view?.private_metadata || "{}"); } catch {}
+  const channel = md.channel_id;
+  const user = body.user.id;
+  const link = body?.actions?.[0]?.value;
+  if (channel && user && link) {
+    try {
+      await client.chat.postEphemeral({
+        channel,
+        user,
+        text: `🔗 ${link}\nTip: usa *Cmd/Ctrl + C* para copiar.`
+      });
+    } catch (e) {
+      console.error("postEphemeral (copy link) failed:", e);
+    }
+  }
+});
+
+/** ====== STEP1 -> ramifica ====== */
 app.view(VIEW.STEP1, async ({ ack, view }) => {
   let md = {};
   try { md = JSON.parse(view.private_metadata || "{}"); } catch {}
@@ -161,7 +213,6 @@ app.view(VIEW.STEP1, async ({ ack, view }) => {
   const state = view.state.values;
   const mode = state[A.MODE]?.[A.MODE]?.selected_option?.value;
   const database_id = state[A.DB]?.[A.DB]?.selected_option?.value;
-  const prefillTitle = md.prefillTitle || "";
 
   if (!mode || !database_id) {
     return ack({
@@ -176,7 +227,7 @@ app.view(VIEW.STEP1, async ({ ack, view }) => {
   try {
     const dbProps = await notion.getDatabaseProperties(database_id);
     const relations = collectRelationTargets(dbProps);
-    const baseMeta = { mode, database_id, relations, prefillTitle };
+    const baseMeta = { ...md, mode, database_id, relations };
 
     if (mode === "edit") {
       const blocks = buildEditSelectBlocks({ A, label: "Page" });
@@ -188,7 +239,10 @@ app.view(VIEW.STEP1, async ({ ack, view }) => {
           title: { type: "plain_text", text: "Edit page" },
           submit: { type: "plain_text", text: "Load" },
           private_metadata: JSON.stringify(baseMeta),
-          blocks
+          blocks: [
+            ...buildPermalinkBlock(md.permalink),
+            ...blocks
+          ]
         }
       });
     }
@@ -203,17 +257,20 @@ app.view(VIEW.STEP1, async ({ ack, view }) => {
           title: { type: "plain_text", text: "Add Subtask" },
           submit: { type: "plain_text", text: "Continue" },
           private_metadata: JSON.stringify({ ...baseMeta, mode: "subtask" }),
-          blocks
+          blocks: [
+            ...buildPermalinkBlock(md.permalink),
+            ...blocks
+          ]
         }
       });
     }
 
-    // CREATE: Title obligatorio, autollenado con prefillTitle
+    // CREATE
     const blocks = buildCreateOrEditBlocks({
       A,
       props: dbProps,
       mode: "create",
-      prefillTitle, // <-- autollenado
+      prefillTitle: md.prefillTitle || "",
     });
 
     return ack({
@@ -224,7 +281,10 @@ app.view(VIEW.STEP1, async ({ ack, view }) => {
         title: { type: "plain_text", text: "Create page" },
         submit: { type: "plain_text", text: "Create" },
         private_metadata: JSON.stringify(baseMeta),
-        blocks
+        blocks: [
+          ...buildPermalinkBlock(md.permalink),
+          ...blocks
+        ]
       }
     });
   } catch (e) {
@@ -236,14 +296,13 @@ app.view(VIEW.STEP1, async ({ ack, view }) => {
   }
 });
 
-/** ====== EDIT_PICK -> cargar form de edición o subtask ====== */
+/** ====== EDIT_PICK ====== */
 app.view(VIEW.EDIT_PICK, async ({ ack, view }) => {
   let md = {};
   try { md = JSON.parse(view.private_metadata || "{}"); } catch {}
-  const { mode, database_id, prefillTitle } = md;
+  const { mode, database_id } = md;
 
   const page_id = view.state.values?.[A.PAGE]?.[A.PAGE]?.selected_option?.value;
-
   if (!page_id) {
     return ack({
       response_action: "errors",
@@ -260,8 +319,7 @@ app.view(VIEW.EDIT_PICK, async ({ ack, view }) => {
         A,
         props: dbProps,
         mode: "edit",
-        initialPage: page,   // prefill desde la página
-        // sin prefillTitle en Edit
+        initialPage: page,
       });
       return ack({
         response_action: "update",
@@ -271,17 +329,20 @@ app.view(VIEW.EDIT_PICK, async ({ ack, view }) => {
           title: { type: "plain_text", text: "Edit page" },
           submit: { type: "plain_text", text: "Update" },
           private_metadata: JSON.stringify({ ...md, page_id }),
-          blocks
+          blocks: [
+            ...buildPermalinkBlock(md.permalink),
+            ...blocks
+          ]
         }
       });
     }
 
-    // SUBTASK: Title obligatorio y autollenado con prefillTitle
+    // SUBTASK: Title autollenado
     const blocks = buildCreateOrEditBlocks({
       A,
       props: dbProps,
       mode: "subtask",
-      prefillTitle,  // <-- autollenado
+      prefillTitle: md.prefillTitle || "",
     });
 
     return ack({
@@ -292,7 +353,10 @@ app.view(VIEW.EDIT_PICK, async ({ ack, view }) => {
         title: { type: "plain_text", text: "Add Subtask" },
         submit: { type: "plain_text", text: "Create" },
         private_metadata: JSON.stringify({ ...md, parent_page_id: page_id, as_subtask: true }),
-        blocks
+        blocks: [
+          ...buildPermalinkBlock(md.permalink),
+          ...blocks
+        ]
       }
     });
   } catch (e) {
@@ -304,9 +368,9 @@ app.view(VIEW.EDIT_PICK, async ({ ack, view }) => {
   }
 });
 
-/** ====== CREATE_FORM (crear página) ====== */
+/** ====== CREATE_FORM ====== */
 app.view(VIEW.CREATE_FORM, async ({ ack, body, view, client }) => {
-  await ack(); // responder rápido al submit final
+  await ack();
   let md = {};
   try { md = JSON.parse(view.private_metadata || "{}"); } catch {}
   const { database_id, as_subtask, parent_page_id } = md;
@@ -315,7 +379,6 @@ app.view(VIEW.CREATE_FORM, async ({ ack, body, view, client }) => {
   const properties = parseSubmission({ values: view.state.values, props: dbProps });
 
   if (as_subtask) {
-    // Si hay una relation a la misma DB, vincula al parent
     const parentRel = Object.entries(dbProps).find(([_, p]) =>
       p?.type === "relation" && (p.relation?.database_id === database_id)
     );
@@ -334,9 +397,9 @@ app.view(VIEW.CREATE_FORM, async ({ ack, body, view, client }) => {
   });
 });
 
-/** ====== EDIT_FORM (actualizar página) ====== */
+/** ====== EDIT_FORM ====== */
 app.view(VIEW.EDIT_FORM, async ({ ack, body, view, client }) => {
-  await ack(); // responder rápido al submit final
+  await ack();
   let md = {};
   try { md = JSON.parse(view.private_metadata || "{}"); } catch {}
   const { database_id, page_id } = md;
