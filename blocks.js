@@ -1,9 +1,9 @@
 /** Render helpers para Slack Blocks ←→ Notion
- * Reglas:
- * - Title es obligatorio en TODOS los modos (create, edit, subtask).
- * - Resto de campos siempre opcionales.
- * - Subtask: el label del título se muestra como "Subtask Title".
- * - Orden: respetamos el orden que entrega Notion (title primero).
+ * - Title obligatorio en TODOS los modos.
+ * - En Create/Subtask el Title se puede autollenar (se pasa por prop prefillTitle desde index.js).
+ * - En Subtask el label del título es "Subtask Title".
+ * - En Create y Subtask el label del Title muestra "(max. 200 characters)".
+ * - Orden de propiedades según Notion (title primero).
  */
 
 const READONLY_TYPES = new Set([
@@ -13,7 +13,6 @@ const READONLY_TYPES = new Set([
 
 const isEditable = (prop) => !READONLY_TYPES.has(prop.type);
 
-/** Ordena: Title primero (si existe) y luego el resto en el orden recibido */
 const orderPropertyEntries = (props) => {
   const entries = Object.entries(props || {});
   let titleKey = null;
@@ -24,7 +23,6 @@ const orderPropertyEntries = (props) => {
   return titleKey ? [[titleKey, props[titleKey]], ...rest] : entries;
 };
 
-/** Mapa de relaciones: { propName: relatedDatabaseId } */
 exports.collectRelationTargets = (props) => {
   const rels = {};
   for (const [name, prop] of Object.entries(props || {})) {
@@ -35,31 +33,28 @@ exports.collectRelationTargets = (props) => {
   return rels;
 };
 
-/**
- * Construye bloques para Create/Edit/Subtask.
- * - Title obligatorio en todos los modos.
- * - Autollenado de Title: usa (en orden) initialPage → prefillTitle → vacío.
- */
 exports.buildCreateOrEditBlocks = ({ A, props, mode, initialPage = null, prefillTitle = "" }) => {
   const initial = initialPage ? convertPageToInitials(initialPage) : null;
 
   const blocks = [];
   const isSubtask = mode === "subtask";
+  const showTitleHint = mode === "create" || mode === "subtask"; // "(max. 200 characters)"
 
   for (const [name, prop] of orderPropertyEntries(props)) {
     if (!isEditable(prop)) continue;
 
     const isTitle = prop.type === "title";
-    // Title SIEMPRE requerido; resto opcional
-    const optional = !isTitle;
-    // En Subtask renombramos el label del Title
-    const labelText = (isSubtask && isTitle) ? "Subtask Title" : name;
+    const optional = !isTitle; // Title siempre requerido
+    let labelText = name;
+    if (isTitle) {
+      labelText = isSubtask ? "Subtask Title" : name;
+      if (showTitleHint) labelText += " (max. 200 characters)";
+    }
 
     const action_id = `prop::${name}`;
     const block_id = action_id;
     const label = { type: "plain_text", text: labelText };
 
-    // Valor inicial del Title: initial → prefillTitle → undefined
     const titleInitialValue = initial?.[name]?.text ?? (isTitle ? (prefillTitle || undefined) : undefined);
 
     switch (prop.type) {
@@ -201,7 +196,6 @@ exports.buildCreateOrEditBlocks = ({ A, props, mode, initialPage = null, prefill
   return blocks;
 };
 
-/** Selector de página para Edit/Subtask */
 exports.buildEditSelectBlocks = ({ A, label = "Page" }) => ([
   {
     type: "input",
@@ -216,15 +210,13 @@ exports.buildEditSelectBlocks = ({ A, label = "Page" }) => ([
   }
 ]);
 
-/** Convierte el formulario de Slack → propiedades de Notion (solo lo que el usuario tocó) */
 exports.parseSubmission = ({ values, props }) => {
   const out = {};
-
   for (const [name, prop] of Object.entries(props || {})) {
     if (!isEditable(prop)) continue;
     const key = `prop::${name}`;
     const slot = values?.[key]?.[key];
-    if (!slot) continue; // si no se tocó, no se envía
+    if (!slot) continue;
 
     switch (prop.type) {
       case "title":
@@ -265,11 +257,9 @@ exports.parseSubmission = ({ values, props }) => {
         break;
     }
   }
-
   return out;
 };
 
-/** Page → valores iniciales para inputs de Slack */
 function convertPageToInitials(page) {
   const out = {};
   const props = page?.properties || {};
